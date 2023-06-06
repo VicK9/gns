@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch
-
+import math
 import rff
 from gns.geometry import construct_3d_basis_from_2_vectors, multiply_matrices
 from gns.my_egnn import EGNN_rot
@@ -235,14 +235,15 @@ class FrameTransformer(nn.Module):
     def forward(self, x, node_embeddings):
         # Preprocess input
         # Split the tensor into two parts
-        v_tensor, p_tensor = torch.chunk(x[..., :-6], 2)
-        v_tensor = v_tensor.reshape(-1, self.trajectory_size, 3)
-        p_tensor = p_tensor.reshape(-1, self.trajectory_size, 3)
+        print(x.shape)
+        nparticles = x.shape[0]
+        v_tensor, p_tensor = torch.chunk(x[..., :-6], 2, dim=-1)
+        v_norm = v_tensor.reshape(nparticles, self.trajectory_size, 3).norm(dim=-1)
+        p_norm = p_tensor.reshape(nparticles, self.trajectory_size, 3).norm(dim=-1)
 
         # Zip the tensors together
-        vel_pos = torch.stack((v_tensor, p_tensor), dim=-1).transpose(-1, -2)
-        norm_x = vel_pos.norm(dim=-1)
-        norm_x = norm_x.reshape(-1, (self.trajectory_size), 2)
+        norm_x = torch.stack((v_norm, p_norm), dim=-1)
+        # norm_x = norm_x.reshape(-1, (self.trajectory_size), 2)
         B2, _, _ = norm_x.shape
         norm_x = self.embed_norms(norm_x)
 
@@ -292,7 +293,15 @@ class FrameTransformer(nn.Module):
 class TemporalEncoder(nn.Module):
     def __init__(
         self,
-        params,
+        embed_dim=128,
+        hidden_dim=256,
+        num_features=6,
+        trajectory_size=5,
+        dropout=0.0,
+        n_layers=4,
+        num_heads=8,
+        n_out_dims=6,
+        particle_type_embedding_size=16,
     ):
         """
         Inputs:
@@ -310,24 +319,30 @@ class TemporalEncoder(nn.Module):
         """
         super().__init__()
 
-        self.embed_dim = params.get("localizer_embedding_size", 128)
-        self.hidden_dim = params.get("localizer_hidden_size", 256)
-        self.num_features = params.get("localizer_n_in_dims", 6)
-        self.n_out_dims = params.get("localizer_n_out_dims", 6)
-        self.num_heads = params.get("localizer_n_heads", 4)
-        self.num_layers = params.get("localizer_n_layers", 2)
-        self.trajectory_size = params.get("window_size", 50)
-        self.dropout_prob = params.get("localizer_dropout", 0.0)
-
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.num_features = num_features
+        self.trajectory_size = trajectory_size
+        self.dropout = dropout
+        self.num_layers = n_layers
+        self.n_out_dims = n_out_dims
+        self.input_dims = 2 * (self.trajectory_size) + particle_type_embedding_size
+        self.num_heads = num_heads
+        self.particle_type_embedding_size = particle_type_embedding_size
+        self.embed_norms_dim = embed_dim - self.particle_type_embedding_size
         # Layers/Networks
-        self.input_layer = nn.Linear(2, self.embed_dim)
+        self.embed_norms = rff.layers.GaussianEncoding(
+            sigma=5.0, input_size=2, encoded_size=self.embed_norms_dim // 2
+        )
+        # self.input_layer = nn.Linear(self.embed_dim, self.embed_dim)
+
         self.transformer = nn.Sequential(
             *[
                 AttentionBlock(
                     self.embed_dim,
                     self.hidden_dim,
                     self.num_heads,
-                    dropout=self.dropout_prob,
+                    dropout=self.dropout,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -336,22 +351,23 @@ class TemporalEncoder(nn.Module):
             nn.LayerNorm(self.embed_dim),
             nn.Linear(self.embed_dim, self.embed_dim),
         )
-        self.dropout = nn.Dropout(self.dropout_prob)
+        self.dropout = nn.Dropout(self.dropout)
 
         # Parameters/Embeddings
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
+        self.positional_encoding = PositionalEncoding(
+            d_model=self.embed_dim, max_len=1 + self.trajectory_size
+        )
 
     def forward(self, x, node_embeddings):
         # Preprocess input
         # Split the tensor into two parts
-        v_tensor, p_tensor = torch.chunk(x[..., :-6], 2)
-        v_tensor = v_tensor.reshape(-1, self.trajectory_size, 3)
-        p_tensor = p_tensor.reshape(-1, self.trajectory_size, 3)
+        v_tensor, p_tensor = torch.chunk(x[..., :-6], 2, dim=-1)
+        v_norm = v_tensor.reshape(-1, self.trajectory_size, 3).norm(dim=-1)
+        p_norm = p_tensor.reshape(-1, self.trajectory_size, 3).norm(dim=-1)
 
         # Zip the tensors together
-        vel_pos = torch.stack((v_tensor, p_tensor), dim=-1).transpose(-1, -2)
-        norm_x = vel_pos.norm(dim=-1)
-        norm_x = norm_x.reshape(-1, (self.trajectory_size), 2)
+        norm_x = torch.stack((v_norm, p_norm), dim=-1)
         B2, _, _ = norm_x.shape
         norm_x = self.embed_norms(norm_x)
 
@@ -479,28 +495,9 @@ class SpatioTemporalEGNN(nn.Module):
 
         self.device = device
 
-    def get_edges(self, batch_size, n_nodes):
-        send_edges, recv_edges = torch.where(~torch.eye(n_nodes, dtype=bool))
-        edges = [torch.LongTensor(send_edges), torch.LongTensor(recv_edges)]
-        if batch_size == 1:
-            return edges
-        elif batch_size > 1:
-            rows, cols = [], []
-            for i in range(batch_size):
-                rows.append(edges[0] + n_nodes * i)
-                cols.append(edges[1] + n_nodes * i)
-            edges = [torch.cat(rows).to(self.device), torch.cat(cols).to(self.device)]
-        return edges
-
     def forward(self, h, edges, rot_rep, edge_attr):
-        B, N, NF = h.shape
-        h = h.reshape(-1, NF)
-        B, E, EF = edge_attr.shape
-        edge_attr = edge_attr.reshape(-1, EF)
-        edges = self.get_edges(batch_size=B, n_nodes=N)
         x, h = self.EGNN(h, rot_rep, edges, edge_attr)
-
-        return h.reshape(B, N, -1), x.reshape(B, N, 3, 2)
+        return h, x.reshape(-1, 3, 2)
 
 
 class SpatioTemporalFrame(nn.Module):
@@ -524,40 +521,71 @@ class SpatioTemporalFrame(nn.Module):
                       on the input encoding
     """
 
-    def __init__(self, params):
+    def __init__(
+        self,
+        embed_dim=128,
+        hidden_dim=256,
+        num_features=6,
+        trajectory_size=5,
+        dropout=0.0,
+        n_layers=4,
+        num_heads=8,
+        n_out_dims=6,
+        particle_type_embedding_size=16,
+        device="cpu",
+    ):
         super().__init__()
-        self.embed_dim = params.get("localizer_embedding_size", 128)
-        self.hidden_dim = params.get("localizer_hidden_size", 256)
-        self.num_features = params.get("localizer_n_in_dims", 6)
-        self.trajectory_size = params.get("window_size", 50)
-        self.dropout = params.get("localizer_dropout", 0.0)
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.num_features = num_features
+        self.trajectory_size = trajectory_size
+        self.dropout = dropout
         self.n_out_dims = 2 * self.trajectory_size
 
         self.temporal_encoder = TemporalEncoder(
-            params=params,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            num_features=num_features,
+            trajectory_size=trajectory_size,
+            dropout=dropout,
+            n_layers=n_layers,
+            num_heads=num_heads,
+            n_out_dims=n_out_dims,
+            particle_type_embedding_size=particle_type_embedding_size,
         )
 
         self.spatial_encoder = SpatioTemporalEGNN(
-            in_node_nf=params.get("localizer_embedding_size", 128),
-            in_edge_nf=2,
-            hidden_nf=params.get("localizer_hidden_size", 128),
-            device="cpu",
+            in_node_nf=embed_dim,
+            in_edge_nf=1,
+            hidden_nf=hidden_dim,
             act_fn=nn.SiLU(),
             n_layers=10,
             coords_weight=1.0,
             recurrent=False,
             norm_diff=False,
             tanh=False,
+            device=device,
         )
 
         # self.gvp_linear = nn.Linear(2 * self.trajectory_size, 2, bias=False)
 
-    def forward(self, x, edges, edge_attr, rot_vec):
+    def forward(self, x, particle_type_embeddings, edges, edge_attr):
         # Rotation representation is the velocity vector of last time step and the difference between the last two time steps
-        rot_vec = rot_vec.reshape(-1, 3, 2)
-
+        v_tensor, p_tensor = torch.chunk(x[..., :-6], 2, dim=-1)
+        v_tensor = v_tensor.reshape(-1, self.trajectory_size, 3)
+        # # Acceleration tensor is the difference between the last two time steps
+        a_tensor = v_tensor[:, -1] - v_tensor[:, -2]
+        # Concatenate the last velocity and acceleration tensors such that the shape is [BN,3,2]
+        rot_vec = (
+            torch.cat([v_tensor[:, -1], a_tensor], dim=-1)
+            .reshape(-1, 2, 3)
+            .transpose(-1, -2)
+        )
+        # rot_vec = x[..., -6:].reshape(-1, 3, 2)
         # Temporal embedding
-        temporal_embed = self.temporal_encoder(x)
+        temporal_embed = self.temporal_encoder(x, particle_type_embeddings)
+        print(temporal_embed.shape)
+        print(temporal_embed.isnan().sum())
         # Spatial embedding
         spatiotemporal_embed, v = self.spatial_encoder(
             temporal_embed, edges, rot_vec, edge_attr
@@ -566,27 +594,6 @@ class SpatioTemporalFrame(nn.Module):
         # st_embed = self.cross_attention(spatial_embed, temporal_embed)
 
         # Construct the rotation matrix
-        out_R = construct_3d_basis_from_2_vectors(v[..., 0], v[..., 1])
+        R = construct_3d_basis_from_2_vectors(v[..., 0], v[..., 1])
 
-        # Preprocess input
-        # The input is of shape [n_particles, (n_timesteps+1)*n_features] where n_features is 4 for 2D coordinates
-        # and 6 for 3D coordinates. The first n_timesteps are the positions and velocities of the particle
-        # and the last 2 features are the distances (upper, lower) from the boundary.
-        norm_x = x.reshape(-1, 2, 3).norm(dim=-1)
-        norm_x = norm_x.reshape(-1, (self.trajectory_size + 1) * 2)
-        mlp_input = torch.cat([norm_x, node_embeddings], dim=-1)
-        out = self.mlp(mlp_input).unsqueeze(-1)
-
-        x = x.reshape(-1, (self.trajectory_size + 1) * 2, 3)
-
-        # BN,2*T,3
-        y = out * x
-        y = self.gvp_linear(y.transpose(-1, -2)).transpose(-1, -2)
-        # Now y is BN,2T,3
-        # The output is a 6D representation of two vectors, which by using Gram-Schmidt orthogonalization
-        # we can construct an SO(3) rotation matrix and a translation vector.
-        v1, v2 = y[..., 0, :], y[..., 1, :]
-
-        R = construct_3d_basis_from_2_vectors(v1, v2)
-
-        return out_R, spatiotemporal_embed
+        return R
