@@ -251,7 +251,6 @@ def train(rank, flags, world_size):
     seed = 42
     flags["seed"] = seed
     torch.manual_seed(seed)
-    serial_simulator = torch.compile(serial_simulator)
     # run = wandb.init(project="gns", resume="st4rfu34")
     wandb.init(project="gns", config=flags)
     wandb.watch(serial_simulator)
@@ -295,6 +294,7 @@ def train(rank, flags, world_size):
             msg = f'Specified model_file {flags["model_path"] + flags["model_file"]} and train_state_file {flags["model_path"] + flags["train_state_file"]} not found.'
             raise FileNotFoundError(msg)
 
+    simulator = torch.compile(simulator)
     simulator.train()
     simulator.to(rank)
 
