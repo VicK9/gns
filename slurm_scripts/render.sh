@@ -1,24 +1,32 @@
 #!/bin/bash
 
-#SBATCH -J pyt_render        # Job name
-#SBATCH -o pyt_render.o%j    # Name of stdout output file
-#SBATCH -e pyt_render.e%j    # Name of stderr error file
-#SBATCH -p rtx               # Queue (partition) name
-#SBATCH -N 1                 # Total # of nodes (must be 1 for serial)
-#SBATCH -n 1                 # Total # of mpi tasks (should be 1 for serial)
-#SBATCH -t 15:00:00          # Run time (hh:mm:ss)
-#SBATCH --mail-type=all      # Send email at begin and end of job
-#SBATCH -A BCS20003          # Project/Allocation name (req'd if you have more than 1)
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --gpus-per-node=2
+#SBATCH --job-name=GNS_locs_rollout
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=5:00:00
+#SBATCH --mem=120000M
+#SBATCH --output=/home/vkyriacou88/output_gns_base_results_%A.out
 
+module purge
+module load 2021
+module load Anaconda3/2021.05
+# source start_venv.sh
+source activate gns
 # fail on error
 set -e
 
 # start in slurm_scripts
-cd ..
-source start_venv.sh
-
+cd ~/gns
 # assume data is already downloaded and hardcode WaterDropSample
-data="Sand-3D-modmeta"
-python3 -m gns.render_rollout \
---rollout_path="${SCRATCH}/gns_pytorch/${data}/rollouts/rollout_0.pkl"
+data="Water-3D"
+for i in {29..99}
+do
+    python3 -m gns.render_rollout \
+    --rollout_dir="/scratch-shared/vkyriacou88/rollout/${data}/locs/" \
+    --rollout_name="rollout_${i}" 
+done
+
 

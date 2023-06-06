@@ -1,26 +1,31 @@
 #!/bin/bash
 
-#SBATCH -J pyt_roll          # Job name
-#SBATCH -o pyt_roll.o%j      # Name of stdout output file
-#SBATCH -e pyt_roll.e%j      # Name of stderr error file
-#SBATCH -p rtx               # Queue (partition) name
-#SBATCH -N 1                 # Total # of nodes (must be 1 for serial)
-#SBATCH -n 1                 # Total # of mpi tasks (should be 1 for serial)
-#SBATCH -t 15:00:00          # Run time (hh:mm:ss)
-#SBATCH --mail-type=all      # Send email at begin and end of job
-#SBATCH -A BCS20003          # Project/Allocation name (req'd if you have more than 1)
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --gpus-per-node=2
+#SBATCH --job-name=GNS_locs_rollout
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=18
+#SBATCH --time=2:00:00
+#SBATCH --mem=120000M
+#SBATCH --output=/home/vkyriacou88/output_gns_base_results_%A.out
 
+module purge
+module load 2021
+module load Anaconda3/2021.05
+# source start_venv.sh
+source activate gns
 # fail on error
 set -e
 
 # start in slurm_scripts
-cd ..
-source start_venv.sh
-
+cd ~/gns
 # assume data is already downloaded and hardcode WaterDropSample
-data="Sand-3D-modmeta"
+data="Water-3D"
+SCRATCH="/scratch-shared/vkyriacou88/"
+
 python3 -m gns.train --mode="rollout" \
---data_path="${SCRATCH}/gns_pytorch/${data}/dataset/" \
---model_path="${SCRATCH}/gns_pytorch/${data}/models/" \
---model_file="model-5000000.pt" \
---output_path="${SCRATCH}/gns_pytorch/${data}/rollouts/"
+--data_path="${SCRATCH}/datasets/${data}/" \
+--model_path="${SCRATCH}/models/${data}/baseline/" \
+--model_file="model-360000.pt" \
+--output_path="${SCRATCH}/rollout/${data}/baseline/"

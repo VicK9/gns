@@ -4,8 +4,8 @@ numpy==1.23.1
 dm-tree
 matplotlib
 pyevtk
-torch
-torch_geometric
-torch_sparse
-torch_scatter
-torch-cluster
+# torch
+# torch_geometric
+# torch_sparse
+# torch_scatter
+# torch-cluster
