@@ -4,7 +4,7 @@ import numpy as np
 from gns import graph_network
 from torch_geometric.nn import radius_graph
 from typing import Dict
-from gns.localise import FrameMLP
+from gns.localise import FrameMLP, FrameTransformer, SpatioTemporalFrame
 from gns.locs_utils import rotate, rotation_matrices_to_quaternions, cart_to_n_spherical
 import pdb
 
@@ -61,6 +61,7 @@ class LearnedSimulator_locs(nn.Module):
         self._particle_type_embedding = nn.Embedding(
             nparticle_types, particle_type_embedding_size
         )
+        self.localizer_type = localizer_type
         if localizer_type == "locs_mlp":
             self._localizer = FrameMLP(
                 embed_dim=128,
@@ -73,7 +74,7 @@ class LearnedSimulator_locs(nn.Module):
                 particle_type_embedding_size=particle_type_embedding_size,
             )
         elif localizer_type == "locs_st_transformer":
-            self._localizer = FrameMLP(
+            self._localizer = SpatioTemporalFrame(
                 embed_dim=128,
                 hidden_dim=256,
                 num_features=6,
@@ -82,15 +83,17 @@ class LearnedSimulator_locs(nn.Module):
                 n_layers=4,
                 n_out_dims=6,
                 particle_type_embedding_size=particle_type_embedding_size,
+                device=device,
             )
         elif localizer_type == "locs_temporal_transformer":
-            self._localizer = FrameMLP(
+            self._localizer = FrameTransformer(
                 embed_dim=128,
                 hidden_dim=256,
                 num_features=6,
                 trajectory_size=5,
                 dropout=0.0,
                 n_layers=4,
+                num_heads=8,
                 n_out_dims=6,
                 particle_type_embedding_size=particle_type_embedding_size,
             )
@@ -175,6 +178,18 @@ class LearnedSimulator_locs(nn.Module):
         )
         node_features = []
 
+        # Relative displacement and distances normalized to radius
+        # with shape (nedges, 2)
+        # normalized_relative_displacements = (
+        #     torch.gather(most_recent_position, 0, senders) -
+        #     torch.gather(most_recent_position, 0, receivers)
+        # ) / self._connectivity_radius
+        normalized_relative_displacements = (
+            most_recent_position[senders, :] - most_recent_position[receivers, :]
+        ) / self._connectivity_radius
+        normalized_relative_displacements_norms = torch.norm(
+            normalized_relative_displacements, dim=-1, keepdim=True
+        )
         # Normalized velocity sequence, merging spatial an time axis.
         velocity_stats = self._normalization_stats["velocity"]
         normalized_velocity_sequence = (
@@ -222,7 +237,14 @@ class LearnedSimulator_locs(nn.Module):
             particle_type_embeddings = self._particle_type_embedding(particle_types)
             node_features.append(particle_type_embeddings)
 
-        R = self._localizer(node_state, particle_type_embeddings)
+        if self.localizer_type == "locs_st_transformer":
+            edge_index = torch.stack([senders, receivers], dim=0).to(self._device)
+            edge_features = normalized_relative_displacements_norms
+            R = self._localizer(
+                node_state, particle_type_embeddings, edge_index, edge_features
+            )
+        else:
+            R = self._localizer(node_state, particle_type_embeddings)
         # nparticles, 3, 3
         Rinv = R.transpose(-1, -2)
 
@@ -250,20 +272,11 @@ class LearnedSimulator_locs(nn.Module):
         # Canonicalized node_features shape (nparticles, 55) for 3D
         # 55 = 15 (5 velocity sequences*dim) + 15 (5 position sequences*dim)+ 6 boundaries + 16 particle embedding + 3 gforce
         # Collect edge features.
-        edge_features = []
-
-        # Relative displacement and distances normalized to radius
-        # with shape (nedges, 2)
-        # normalized_relative_displacements = (
-        #     torch.gather(most_recent_position, 0, senders) -
-        #     torch.gather(most_recent_position, 0, receivers)
-        # ) / self._connectivity_radius
-        normalized_relative_displacements = (
-            most_recent_position[senders, :] - most_recent_position[receivers, :]
-        ) / self._connectivity_radius
 
         send_R = R[senders, :]
         recv_Rinv = Rinv[receivers, :]
+
+        edge_features = []
 
         rotated_relative_displacements = torch.bmm(
             recv_Rinv, normalized_relative_displacements.unsqueeze(-1)
@@ -287,10 +300,10 @@ class LearnedSimulator_locs(nn.Module):
 
         # Add relative distance between 2 particles with shape (nparticles, 1)
         # Edge features has a final shape of (nparticles, ndim + 1)
-        normalized_relative_distances = torch.norm(
-            normalized_relative_displacements, dim=-1, keepdim=True
-        )
-        edge_features.append(normalized_relative_distances)
+        # normalized_relative_distances = torch.norm(
+        #     normalized_relative_displacements, dim=-1, keepdim=True
+        # )
+        edge_features.append(normalized_relative_displacements_norms)
         # Add relative orientation between two particles as an edge feature
         # with shape (nparticles, 4)
         edge_features.append(rotated_quaternions)
