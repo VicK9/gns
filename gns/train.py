@@ -427,7 +427,7 @@ def _get_simulator(
         },
     }
 
-    if model == "baseline":
+    if model == "gns":
         simulator = learned_simulator.LearnedSimulator(
             particle_dimensions=metadata["dim"],
             nnode_in=37 if metadata["dim"] == 3 else 30,
