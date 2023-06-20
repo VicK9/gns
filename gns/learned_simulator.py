@@ -6,6 +6,7 @@ from torch_geometric.nn import radius_graph
 from typing import Dict
 from gns.localise import FrameMLP, FrameTransformer, SpatioTemporalFrame
 from gns.locs_utils import rotate, rotation_matrices_to_quaternions, cart_to_n_spherical
+from gns.geometry import construct_3d_basis_from_2_vectors
 import pdb
 
 
@@ -62,7 +63,9 @@ class LearnedSimulator_locs(nn.Module):
             nparticle_types, particle_type_embedding_size
         )
         self.localizer_type = localizer_type
-        if localizer_type == "locs_mlp":
+        if localizer_type == "locs_velacc":
+            self._localizer = get_matrix_from_vel_accel
+        elif localizer_type == "locs_mlp":
             self._localizer = FrameMLP(
                 embed_dim=128,
                 hidden_dim=256,
@@ -243,6 +246,8 @@ class LearnedSimulator_locs(nn.Module):
             R = self._localizer(
                 node_state, particle_type_embeddings, edge_index, edge_features
             )
+        elif self.localizer_type == "locs_velacc":
+            R = self._localizer(normalized_velocity_sequence)
         else:
             R = self._localizer(node_state, particle_type_embeddings)
         # nparticles, 3, 3
@@ -843,6 +848,21 @@ class LearnedSimulator(nn.Module):
           path: Model path
         """
         self.load_state_dict(torch.load(path, map_location=torch.device("cpu")))
+
+
+def get_matrix_from_vel_accel(vel: torch.tensor) -> torch.tensor:
+    """Compute acceleration and then get matrix from velocity and
+       acceleration using Gram-Schmidt process
+       (construct_3d_basis_from_2_vectors)
+
+    Args:
+      vel: Velocity tensor & shape(nparticles, 6 steps, dim)
+
+    Returns:
+      torch.tensor: Matrix & shape(nparticles, dim, dim)
+    """
+    acc = time_diff(vel)
+    return construct_3d_basis_from_2_vectors(vel[:, -1], acc[:, -1])
 
 
 def time_diff(position_sequence: torch.tensor) -> torch.tensor:
