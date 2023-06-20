@@ -58,13 +58,22 @@ flags.DEFINE_string(
         "The type of simulator to use. Default is gns and other options are different localizer types. Such as locs_mlp, locs_st_transformer, locs_temporal_transformer"
     ),
 )
-
+flags.DEFINE_string(
+    "wandb_id",
+    None,
+    help=(
+        "The type of simulator to use. Default is gns and other options are different localizer types. Such as locs_mlp, locs_st_transformer, locs_temporal_transformer"
+    ),
+)
 flags.DEFINE_integer("ntraining_steps", int(2e7), help="Number of training steps.")
+flags.DEFINE_integer(
+    "nval_steps", int(5000), help="Number of steps at which to save the model."
+)
 flags.DEFINE_integer(
     "nsave_steps", int(5000), help="Number of steps at which to save the model."
 )
 flags.DEFINE_integer(
-    "nlog_steps", int(50), help="Number of steps at which to log the loss."
+    "nlog_steps", int(5000), help="Number of steps at which to log the loss."
 )
 # Learning rate parameters
 flags.DEFINE_float("lr_init", 1e-4, help="Initial learning rate.")
@@ -143,9 +152,79 @@ def rollout(
         "predicted_rollout": predictions.cpu().numpy(),
         "ground_truth_rollout": ground_truth_positions.cpu().numpy(),
         "particle_types": particle_types.cpu().numpy(),
+        "loss": loss.cpu().numpy(),
     }
 
     return output_dict, loss
+
+
+def evaluate(simulator, device: str, flags, split="valid"):
+    """Predict rollouts.
+
+    Args:
+      simulator: Trained simulator if not will undergo training.
+
+    """
+    metadata = reading_utils.read_metadata(flags["data_path"])
+
+    simulator.eval()
+
+    # Use `valid`` set for eval mode if not use `test`
+
+    # Output path
+    if split == "test" and not os.path.exists(flags["output_path"]):
+        os.makedirs(flags["output_path"])
+    # if split == "test":
+    #     wandb.init(project="gns", resume=flags["wandb_id)
+    ds = data_loader.get_data_loader_by_trajectories(
+        path=f"{flags['data_path']}{split}.npz"
+    )
+
+    eval_loss = []
+    step_losses = []
+    with torch.no_grad():
+        for example_i, (positions, particle_type, n_particles_per_example) in enumerate(
+            ds
+        ):
+            positions.to(device)
+            particle_type.to(device)
+            n_particles_per_example = torch.tensor(
+                [int(n_particles_per_example)], dtype=torch.int32
+            ).to(device)
+
+            nsteps = metadata["sequence_length"] + 1 - INPUT_SEQUENCE_LENGTH
+            # Predict example rollout
+            example_rollout, loss = rollout(
+                simulator.module,
+                positions.to(device),
+                particle_type.to(device),
+                n_particles_per_example.to(device),
+                nsteps,
+                device,
+            )
+
+            example_rollout["metadata"] = metadata
+            # if split == "test":
+            # wandb.log({f"{split}/example_{example_i}_loss": loss})
+            print("Predicting example {} loss: {}".format(example_i, loss.mean()))
+            eval_loss.append(torch.flatten(loss))
+            # Save rollout in testing
+            if split == "test":
+                example_rollout["metadata"] = metadata
+                filename = f"rollout_{example_i}.pkl"
+                filename = os.path.join(flags["output_path"], filename)
+                with open(filename, "wb") as f:
+                    pickle.dump(example_rollout, f)
+    print(
+        "Mean loss on rollout prediction: {}".format(torch.mean(torch.cat(eval_loss)))
+    )
+
+    if split == "test":
+        print("Finished predicting rollouts.")
+        # wandb.log({f"{split}/eval_loss": torch.mean(torch.cat(eval_loss))})
+        # wandb.finish()
+    else:
+        return torch.mean(torch.cat(eval_loss))
 
 
 def predict(device: str, FLAGS):
@@ -176,6 +255,8 @@ def predict(device: str, FLAGS):
     # Use `valid`` set for eval mode if not use `test`
     split = "test" if FLAGS.mode == "rollout" else "valid"
 
+    # if split == "test":
+    #     wandb.init(project="gns", resume=FLAGS.wandb_id)
     ds = data_loader.get_data_loader_by_trajectories(
         path=f"{FLAGS.data_path}{split}.npz"
     )
@@ -203,6 +284,8 @@ def predict(device: str, FLAGS):
             )
 
             example_rollout["metadata"] = metadata
+            # if split == "test":
+            # wandb.log({f"{split}/example_{example_i}_loss": loss})
             print("Predicting example {} loss: {}".format(example_i, loss.mean()))
             eval_loss.append(torch.flatten(loss))
 
@@ -213,10 +296,15 @@ def predict(device: str, FLAGS):
                 filename = os.path.join(FLAGS.output_path, filename)
                 with open(filename, "wb") as f:
                     pickle.dump(example_rollout, f)
-
     print(
         "Mean loss on rollout prediction: {}".format(torch.mean(torch.cat(eval_loss)))
     )
+    if split == "test":
+        print("Finished predicting rollouts.")
+        # wandb.log({f"{split}/eval_loss": torch.mean(torch.cat(eval_loss))})
+        # wandb.finish()
+    else:
+        return torch.mean(torch.cat(eval_loss))
 
 
 def optimizer_to(optim, device):
@@ -252,14 +340,20 @@ def train(rank, flags, world_size):
     flags["seed"] = seed
     torch.manual_seed(seed)
     # run = wandb.init(project="gns", resume="st4rfu34")
-    wandb.init(project="gns", config=flags)
-    wandb.watch(serial_simulator)
+
     simulator = DDP(serial_simulator.to(rank), device_ids=[rank], output_device=rank)
+
+    if rank == 0:
+        if flags["wandb_id"] is not None:
+            wandb.init(project="gns", resume=flags["wandb_id"])
+        else:
+            wandb.init(project="gns", config=flags)
+        wandb.watch(serial_simulator)
     optimizer = torch.optim.Adam(
         simulator.parameters(), lr=flags["lr_init"] * world_size
     )
     step = 0
-
+    epoch = 0
     # If model_path does exist and model_file and train_state_file exist continue training.
     if flags["model_file"] is not None:
         if flags["model_file"] == "latest" and flags["train_state_file"] == "latest":
@@ -303,7 +397,9 @@ def train(rank, flags, world_size):
         input_length_sequence=INPUT_SEQUENCE_LENGTH,
         batch_size=flags["batch_size"],
     )
-
+    number_of_batches_per_epoch = len(dl)
+    print("Dataloader size: ", number_of_batches_per_epoch)
+    epoch = step // number_of_batches_per_epoch
     print(f"rank = {rank}, cuda = {torch.cuda.is_available()}")
     not_reached_nsteps = True
     try:
@@ -361,9 +457,16 @@ def train(rank, flags, world_size):
                     print(
                         f'Training step: {step}/{flags["ntraining_steps"]}. Loss: {loss}.'
                     )
-                if step % flags["nlog_steps"] == 0:
+                if step % flags["nlog_steps"] == 0 and rank == 0:
                     wandb.log({"train/loss": loss})
                     wandb.log({"train/lr": lr_new})
+                    wandb.log({"train/step": step})
+                    wandb.log({"train/epoch": epoch})
+
+                if step % flags["nval_steps"] == 0 and step != 0 and rank == 0:
+                    loss_val = evaluate(simulator, rank, flags)
+                    wandb.log({"val/loss": loss_val})
+                    simulator.train()
 
                 # Save model state
                 if step % flags["nsave_steps"] == 0 and rank == 0:
@@ -384,6 +487,7 @@ def train(rank, flags, world_size):
                     break
 
                 step += 1
+            epoch += 1
 
     except KeyboardInterrupt:
         pass
@@ -481,7 +585,10 @@ def main(_):
     myflags["model_path"] = FLAGS.model_path
     myflags["train_state_file"] = FLAGS.train_state_file
     myflags["nlog_steps"] = FLAGS.nlog_steps
+    myflags["nval_steps"] = FLAGS.nval_steps
     myflags["model_name"] = FLAGS.model_name
+    myflags["wandb_id"] = FLAGS.wandb_id
+    print(FLAGS.wandb_id)
     # Read metadata
     if FLAGS.mode == "train":
         # If model_path does not exist create new directory.
@@ -490,13 +597,17 @@ def main(_):
 
         world_size = torch.cuda.device_count()
         print(f"world_size = {world_size}")
+        print(f"myflags = {myflags.get('wandb_id')}")
         distribute.spawn_train(train, myflags, world_size)
 
     elif FLAGS.mode in ["valid", "rollout"]:
         # Set device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(FLAGS.model_file)
+        print(f"device = {device}")
         if FLAGS.cuda_device_number is not None and torch.cuda.is_available():
             device = torch.device(f"cuda:{int(FLAGS.cuda_device_number)}")
+        print(f"FLAGS.model_name = {FLAGS.model_name}")
         predict(device, FLAGS)
 
 
