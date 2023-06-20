@@ -235,7 +235,6 @@ class FrameTransformer(nn.Module):
     def forward(self, x, node_embeddings):
         # Preprocess input
         # Split the tensor into two parts
-        print(x.shape)
         nparticles = x.shape[0]
         v_tensor, p_tensor = torch.chunk(x[..., :-6], 2, dim=-1)
         v_norm = v_tensor.reshape(nparticles, self.trajectory_size, 3).norm(dim=-1)
@@ -584,8 +583,7 @@ class SpatioTemporalFrame(nn.Module):
         # rot_vec = x[..., -6:].reshape(-1, 3, 2)
         # Temporal embedding
         temporal_embed = self.temporal_encoder(x, particle_type_embeddings)
-        print(temporal_embed.shape)
-        print(temporal_embed.isnan().sum())
+
         # Spatial embedding
         spatiotemporal_embed, v = self.spatial_encoder(
             temporal_embed, edges, rot_vec, edge_attr
