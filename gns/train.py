@@ -399,6 +399,7 @@ def train(rank, flags, world_size):
     )
     number_of_batches_per_epoch = len(dl)
     print("Dataloader size: ", number_of_batches_per_epoch)
+    wandb.log({"train/num_batches": number_of_batches_per_epoch})
     epoch = step // number_of_batches_per_epoch
     print(f"rank = {rank}, cuda = {torch.cuda.is_available()}")
     not_reached_nsteps = True
